@@ -404,19 +404,6 @@ export class NitroWriter implements Writer {
   }
 
   async tap(testID: string): Promise<boolean> {
-    // Native activation (fireActivation / UIControl sendActions) reaches
-    // TouchableOpacity onPress even when idb HID touches miss RNGH /
-    // disabled-wrapper edge cases. Fall back to prepareTap + HID when
-    // the in-process path can't resolve the testID.
-    try {
-      const native = await this.send('tapNative', { testID });
-      if (native?.success === true) {
-        await this.client.waitForCommit(200);
-        return true;
-      }
-    } catch {
-      /* fall through */
-    }
     // Batched JSI prepare: stable-coord poll + auto-scroll + UIMenu
     // check in one CDP round trip. ~5-10× fewer round trips than the
     // old CLI-side layoutCenter loop. Actuation stays on idb HID —
@@ -611,15 +598,7 @@ export class NitroWriter implements Writer {
     // Per-char onChangeText validators still see the change (paste
     // dispatches a single insertText), so masked-input formatters
     // (phone, expiry, etc.) still run. Keyboard-layout independent.
-    // Skip paste when text contains `\n` — Maestro sends those as Return
-    // key events, not literal newline characters, and paste won't fire
-    // onSubmitEditing handlers that advance multiline forms.
-    // Controlled form fields need onChangeText for canSubmit — paste can
-    // miss TanStack Form state on `value={field.state.value}` inputs.
-    const skipPasteForControlledFormField =
-      testID === 'thread-title' ||
-      (typeof testID === 'string' && testID.startsWith('rules-input-'));
-    if (testID && !text.includes('\n') && !skipPasteForControlledFormField) {
+    if (testID) {
       await this.setClipboard(text);
       const r = await this.send('pasteFromClipboard', { testID });
       if (r?.success === true) {
@@ -905,18 +884,6 @@ export class NitroWriter implements Writer {
       // first-commit gap on the destination tab.
       await new Promise((r) => setTimeout(r, 100));
       return true;
-    }
-    // Native label tap — walks to TouchableOpacity ancestor and fires
-    // onPress via UIControl/gesture activation. Prefer over HID for
-    // short button labels where the AX leaf is a nested Text view.
-    try {
-      const lbl = await this.send('tapByLabel', { text });
-      if (lbl?.success === true) {
-        await this.client.waitForCommit(200);
-        return true;
-      }
-    } catch {
-      /* fall through */
     }
     // 2) Accessibility-label query inside the app's UIView tree.
     //    Resolves the matched view's window-relative frame, then defers

@@ -490,14 +490,6 @@ static const std::unordered_map<std::string, HandlerFn>& commandHandlers() {
             r.data = oss.str();
             r.success = std::get<2>(frame) > 0 && std::get<3>(frame) > 0;
         }},
-        { "tapByLabel", [](HybridEnnio*, const auto& req, auto& r) {
-            r.success = ::ennio::EnnioRuntimeHelper::getInstance().tapByLabel(
-                ::ennio::json::parseString(req.payload, "text"));
-        }},
-        { "tapNative", [](HybridEnnio*, const auto& req, auto& r) {
-            r.success = ::ennio::EnnioRuntimeHelper::getInstance().tap(
-                ::ennio::json::parseString(req.payload, "testID"));
-        }},
         { "hitTestVerify", [](HybridEnnio*, const auto& req, auto& r) {
             double x = ::ennio::json::parseDouble(req.payload, "x");
             double y = ::ennio::json::parseDouble(req.payload, "y");

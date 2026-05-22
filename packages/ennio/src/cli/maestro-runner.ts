@@ -599,7 +599,8 @@ class MaestroExecutor {
       }
       case 'extendedWaitUntil': {
         const w = val as { visible?: MaestroSelector; notVisible?: MaestroSelector };
-        if (w.visible) return `extendedWaitUntil visible ${this.formatSelector(normalizeSelector(w.visible))}`;
+        if (w.visible)
+          return `extendedWaitUntil visible ${this.formatSelector(normalizeSelector(w.visible))}`;
         if (w.notVisible) {
           return `extendedWaitUntil not visible ${this.formatSelector(normalizeSelector(w.notVisible))}`;
         }
@@ -1612,8 +1613,7 @@ class MaestroExecutor {
       // key events — paste can't fire onSubmitEditing for multiline forms.
       // TanStack Form controlled fields need per-char HID so canSubmit updates.
       const skipPaste = text.includes('\n') || this.needsFormValidationSettle();
-      const paste =
-        !skipPaste && (await this.client.send('pasteIntoFocusedField', { text }));
+      const paste = !skipPaste && (await this.client.send('pasteIntoFocusedField', { text }));
       if (paste?.success === true) {
         this.log(`inputText: via UIKit paste:`);
         await this.waitCommit(TAP_BACK_RECOVER_DELAY_MS);
@@ -1633,8 +1633,7 @@ class MaestroExecutor {
       // before falling back to layout-fragile HID typing.
       if (this.lastTappedSelector) {
         await this.tap(this.lastTappedSelector);
-        const retry =
-          !skipPaste && (await this.client.send('pasteIntoFocusedField', { text }));
+        const retry = !skipPaste && (await this.client.send('pasteIntoFocusedField', { text }));
         if (retry?.success === true) {
           this.log(`inputText: via UIKit paste (after re-tap):`);
           await this.waitCommit(TAP_BACK_RECOVER_DELAY_MS);
@@ -1773,8 +1772,7 @@ class MaestroExecutor {
     }
 
     if ('runFlow' in cmd) {
-      const runFlowCmd =
-        typeof cmd.runFlow === 'string' ? { file: cmd.runFlow } : cmd.runFlow;
+      const runFlowCmd = typeof cmd.runFlow === 'string' ? { file: cmd.runFlow } : cmd.runFlow;
       if (runFlowCmd.file) {
         this.log(`runFlow: ${runFlowCmd.file}`);
       } else if (runFlowCmd.when) {
@@ -2427,12 +2425,7 @@ class MaestroExecutor {
           return;
         }
         // Scroll while waiting for off-screen list rows (e.g. explore threads).
-        if (
-          scrollAttempts < 20 &&
-          Date.now() - startTime > 500 &&
-          selector.text &&
-          !selector.id
-        ) {
+        if (scrollAttempts < 20 && Date.now() - startTime > 500 && selector.text && !selector.id) {
           await this.scroll('down', 300);
           scrollAttempts++;
         }
@@ -2661,9 +2654,7 @@ class MaestroExecutor {
         const errMsg = (err as Error).message;
         if (optional) {
           const cmdName = typeof cmd === 'string' ? cmd : Object.keys(cmd as object)[0];
-          this.debugLog(
-            `optional ${cmdName}: did not run — ${errMsg}`,
-          );
+          this.debugLog(`optional ${cmdName}: did not run — ${errMsg}`);
           this.log(`  (optional ${cmdName} failed, continuing): ${errMsg}`);
         } else {
           this.debugLog(`step ${this.stepIndex} failed — ${errMsg}`);

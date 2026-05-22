@@ -292,8 +292,7 @@ export function expandFlow(
   // Process commands and load any referenced subflows
   for (const cmd of flow.commands) {
     if ('runFlow' in cmd) {
-      const subflowFile =
-        typeof cmd.runFlow === 'string' ? cmd.runFlow : cmd.runFlow.file;
+      const subflowFile = typeof cmd.runFlow === 'string' ? cmd.runFlow : cmd.runFlow.file;
       if (!subflowFile) continue;
       const subflowPath = resolveSubflowPath(flow.filePath, subflowFile);
       if (existsSync(subflowPath)) {

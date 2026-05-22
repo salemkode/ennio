@@ -76,7 +76,7 @@ export type MaestroCommand =
   | { longPress: MaestroSelector | string }
   | { longPressOn: MaestroSelector | string }
   | { back: true }
-  | { runFlow: RunFlowCommand }
+  | { runFlow: RunFlowCommand | string }
   | { waitFor: MaestroSelector & { timeout?: number } }
   | { assertAnyVisible: { anyOf: MaestroSelector[] } }
   | { launchApp: true | { clearState?: boolean; appId?: string } }
@@ -291,8 +291,11 @@ export function expandFlow(
 
   // Process commands and load any referenced subflows
   for (const cmd of flow.commands) {
-    if ('runFlow' in cmd && cmd.runFlow.file) {
-      const subflowPath = resolveSubflowPath(flow.filePath, cmd.runFlow.file);
+    if ('runFlow' in cmd) {
+      const subflowFile =
+        typeof cmd.runFlow === 'string' ? cmd.runFlow : cmd.runFlow.file;
+      if (!subflowFile) continue;
+      const subflowPath = resolveSubflowPath(flow.filePath, subflowFile);
       if (existsSync(subflowPath)) {
         const subflow = parseMaestroFile(subflowPath);
         subflows.push(subflow);

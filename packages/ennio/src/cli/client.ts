@@ -169,6 +169,7 @@ const SOCKET_FAST_OPS = new Set<string>([
   // off-screen. Routing both through the socket bypasses the
   // JS-thread queue that previously paced each iteration.
   'getViewWindowFrame',
+  'isVisible',
   'scrollTo',
   'selectPickerValueByLabel',
   'selectSegmentByLabel',
@@ -177,6 +178,8 @@ const SOCKET_FAST_OPS = new Set<string>([
   'eraseSearchBarText',
   'focusSearchBar',
   'pasteIntoFocusedField',
+  'fireTapByTestID',
+  'tapByLabel',
   'ping',
 ]);
 

@@ -1,0 +1,3 @@
+appId: com.ennio.example
+---
+- evalScript: ${CHILD_RAN = true}

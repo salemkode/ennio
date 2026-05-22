@@ -122,6 +122,17 @@ static Response dispatchRequest(const Request& req) {
             << ",\"width\":" << std::get<2>(frame) << ",\"height\":" << std::get<3>(frame) << "}";
         r.data = oss.str();
         r.success = std::get<2>(frame) > 0 && std::get<3>(frame) > 0;
+    } else if (req.type == "isVisible") {
+        // Pure UIKit visibility — same logic as HybridEnnio::isVisible.
+        // extendedWaitUntil polls this in a tight loop; CDP would queue
+        // behind JS-thread work and hit 30s timeouts after launchApp.
+        auto& helper = EnnioRuntimeHelper::getInstance();
+        const std::string testID = json::parseString(req.payload, "testID");
+        auto frame = helper.getViewWindowFrame(testID);
+        const bool mounted = std::get<2>(frame) > 0 && std::get<3>(frame) > 0;
+        const bool visible = mounted && helper.isViewOnscreen(testID);
+        r.success = true;
+        r.data = visible ? "true" : "false";
     } else if (req.type == "scrollTo") {
         // Walks up to the enclosing UIScrollView and sets contentOffset
         // to bring the element into view. Pure UIKit on main thread —
@@ -179,6 +190,17 @@ static Response dispatchRequest(const Request& req) {
         // didSelectRow so RNCPicker emits onValueChange.
         r.success = EnnioRuntimeHelper::getInstance().selectPickerValueByLabel(
             json::parseString(req.payload, "label"));
+    } else if (req.type == "fireTapByTestID") {
+        // Direct UIControl / gesture-recognizer activation for testID
+        // targets. HID taps on TouchableOpacity often land on inner Text
+        // labels without firing onPress; this path bypasses hit-test.
+        r.success = EnnioRuntimeHelper::getInstance().fireTapByTestID(
+            json::parseString(req.payload, "testID"));
+    } else if (req.type == "tapByLabel") {
+        // Native label match + fireActivation walk. Pressable / RNGH
+        // buttons whose inner Text receives HID hits without onPress.
+        r.success = EnnioRuntimeHelper::getInstance().tapByLabel(
+            json::parseString(req.payload, "text"));
     } else if (req.type == "ping") {
         r.success = true;
         r.data = "\"pong\"";

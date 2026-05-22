@@ -61,6 +61,7 @@ function parseMaestroPoint(p: string | { x: number | string; y: number | string 
 const DEFAULT_TIMEOUT = 3000;
 const DEFAULT_VISIBLE_TIMEOUT = 5000;
 const DEFAULT_RETRY_INTERVAL = 30;
+const WHEN_ID_VISIBLE_POLL_MS = 5000; // runFlow `when: visible: id:` — UI may mount after launchApp idle.
 const DEFAULT_RECONNECT_TIMEOUT = 30000;
 
 // Per-command timing constants. All in ms unless noted. Pulled from the
@@ -74,6 +75,7 @@ const KEYBOARD_DISMISS_SETTLE_MS = 120; // Settle after hideKeyboard before re-t
 const POST_LAUNCH_SETTLE_MS = 400; // Wait for sim teardown after clearState before relaunch.
 const POST_LAUNCH_IDLE_BUDGET_MS = 1500; // First waitForIdle after a launch.
 const TYPE_TEXT_IDLE_BUDGET_MS = 600; // Drain RN bridge after typeText so onChangeText commits before the next tap reads `value`.
+const FORM_VALIDATION_DEBOUNCE_MS = 550; // TanStack Form onChangeAsyncDebounceMs — paste/HID can outrun canSubmit.
 const POST_LAUNCH_SHADOW_COMMIT_MS = 250; // First shadow-tree commit settle after reconnect.
 const RETRY_POLL_MS = 100; // Predicate retry tick for waitFor / extendedWaitUntil.
 const POINT_TAP_SETTLE_MS = 60; // Quick settle after tapAt — no tab-nav animation.
@@ -347,7 +349,7 @@ export async function runMaestroTests(
   writer: Writer,
   reader: Reader,
   testFilePath: string,
-  options: { verbose?: boolean; trace?: boolean } = {},
+  options: { verbose?: boolean; trace?: boolean; debug?: boolean } = {},
 ): Promise<MaestroTestsResult> {
   const results: MaestroTestsResult = { passed: 0, failed: 0, tests: [], client };
   const flow = parseMaestroFile(testFilePath);
@@ -380,6 +382,7 @@ export async function runMaestroTests(
   const executor = new MaestroExecutor(client, writer, reader, testFilePath, {
     verbose: options.verbose,
     trace: options.trace,
+    debug: options.debug,
     appId: flow.appId,
     reconnectClient,
     env: flow.env,
@@ -470,6 +473,8 @@ class MaestroExecutor {
   private lastTappedSelector: MaestroSelector | null = null;
   private verbose: boolean;
   private trace: boolean;
+  private debug: boolean;
+  private stepIndex = 0;
   private appId: string | null;
   private reconnectClient: () => Promise<EnnioClient>;
   private jsContext: JsContext;
@@ -487,6 +492,7 @@ class MaestroExecutor {
     options: {
       verbose?: boolean;
       trace?: boolean;
+      debug?: boolean;
       appId?: string;
       reconnectClient?: () => Promise<EnnioClient>;
       env?: Record<string, string>;
@@ -498,6 +504,7 @@ class MaestroExecutor {
     this.currentFlowPath = flowPath;
     this.verbose = options.verbose ?? false;
     this.trace = options.trace ?? false;
+    this.debug = options.debug ?? true;
     this.appId = options.appId ?? null;
     this.reconnectClient = options.reconnectClient ?? (async () => this.client);
     this.flowEnv = { ...(options.env || {}) };
@@ -535,6 +542,80 @@ class MaestroExecutor {
       const d = `Δ${delta}ms`.padStart(7);
       console.log(`    [${cum} ${d}] ${msg}`);
       this.profileEvents.push({ msg, delta });
+    }
+  }
+
+  /** Human-readable step narrative — separate from verbose timing logs. */
+  private debugLog(msg: string): void {
+    if (this.debug) {
+      console.log(`  [debug] ${msg}`);
+    }
+  }
+
+  private formatSelector(selector: MaestroSelector): string {
+    if (selector.id && selector.text) {
+      return `id:"${selector.id}" text:"${selector.text}"`;
+    }
+    if (selector.id) return `id:"${selector.id}"`;
+    if (selector.text) return `text:"${selector.text}"`;
+    if (selector.point) return `point:${JSON.stringify(selector.point)}`;
+    return JSON.stringify(selector);
+  }
+
+  private formatCondition(condition: MaestroCondition): string {
+    if (condition.visible) {
+      return `visible ${this.formatSelector(normalizeSelector(condition.visible))}`;
+    }
+    if (condition.notVisible) {
+      return `not visible ${this.formatSelector(normalizeSelector(condition.notVisible))}`;
+    }
+    return 'unknown condition';
+  }
+
+  private summarizeCommand(cmd: MaestroCommand): string {
+    if (cmd == null) return '(empty)';
+    if (typeof cmd === 'string') return cmd;
+    const entry = Object.entries(cmd)[0];
+    if (!entry) return '(empty)';
+    const [key, val] = entry;
+    const opt = isOptional(cmd) ? ' (optional)' : '';
+    switch (key) {
+      case 'tapOn':
+        return `tapOn ${this.formatSelector(normalizeSelector(val as MaestroSelector | string))}${opt}`;
+      case 'doubleTapOn':
+        return `doubleTapOn ${this.formatSelector(normalizeSelector(val as MaestroSelector | string))}`;
+      case 'assertVisible':
+        return `assertVisible ${this.formatSelector(normalizeSelector(val as MaestroSelector | string))}${opt}`;
+      case 'assertNotVisible':
+        return `assertNotVisible ${this.formatSelector(normalizeSelector(val as MaestroSelector | string))}${opt}`;
+      case 'runFlow': {
+        const rf = typeof val === 'string' ? { file: val } : (val as RunFlowCommand);
+        if (rf.when) {
+          const target = rf.file ? ` → ${rf.file}` : rf.commands ? ' → inline commands' : '';
+          return `runFlow when ${this.formatCondition(rf.when)}${target}`;
+        }
+        if (rf.file) return `runFlow ${rf.file}`;
+        return 'runFlow (inline)';
+      }
+      case 'extendedWaitUntil': {
+        const w = val as { visible?: MaestroSelector; notVisible?: MaestroSelector };
+        if (w.visible) return `extendedWaitUntil visible ${this.formatSelector(normalizeSelector(w.visible))}`;
+        if (w.notVisible) {
+          return `extendedWaitUntil not visible ${this.formatSelector(normalizeSelector(w.notVisible))}`;
+        }
+        return 'extendedWaitUntil';
+      }
+      case 'scrollUntilVisible': {
+        const hasElement = typeof val === 'object' && val !== null && 'element' in val;
+        const sel = normalizeSelector(
+          hasElement ? (val as { element: MaestroSelector }).element : (val as MaestroSelector),
+        );
+        return `scrollUntilVisible ${this.formatSelector(sel)}`;
+      }
+      case 'inputText':
+        return `inputText "${String(val).slice(0, 40)}${String(val).length > 40 ? '…' : ''}"`;
+      default:
+        return key + opt;
     }
   }
 
@@ -665,14 +746,15 @@ class MaestroExecutor {
     }
     if (ennioSelector.id && Object.keys(ennioSelector).length === 1) {
       const id = ennioSelector.id as string;
-      const inTree = await this.reader.existsById(id);
+      const inTree = await this.reader.isVisibleById(id);
       if (inTree) return true;
       // NativeTabs fallback: UITabBarItems aren't in Fabric's shadow
-      // tree — react-native-screens sets the testID on
-      // `UITabBarItem.accessibilityIdentifier` instead. Ask the
-      // in-app helper to walk the UITabBarController and match by
-      // accessibilityIdentifier / title. No convention assumed about
-      // id shape; any id can in principle be a tab id.
+      // tree — expo-router sets testID `tab-<name>` on the trigger while
+      // findTabByName matches tabBarItem.title / accessibilityIdentifier.
+      if (id.startsWith('tab-')) {
+        const tabKey = id.slice(4);
+        if (await this.client.findTabByName(tabKey)) return true;
+      }
       return this.client.findTabByName(id);
     }
     return this.reader.existsBySelector(ennioSelector);
@@ -693,12 +775,56 @@ class MaestroExecutor {
       const id = ennioSelector.id as string;
       const inTree = await this.reader.isVisibleById(id);
       if (inTree) return true;
-      // Same NativeTabs fallback as selectorExists — a UITabBarItem
-      // that's part of an on-screen tab bar is "visible" by any
-      // reasonable user-facing definition.
+      // UIKit visibility can lead Fabric shadow tree (feed lists, sheets).
+      try {
+        const r = await this.client.send('isVisible', { testID: id });
+        if (r?.data === 'true') return true;
+      } catch {
+        /* fall through */
+      }
+      // Same NativeTabs fallback as selectorExists — match tab-<name>
+      // testIDs against UITabBarItem title / accessibilityIdentifier.
+      if (id.startsWith('tab-')) {
+        const tabKey = id.slice(4);
+        if (await this.client.findTabByName(tabKey)) return true;
+      }
       return this.client.findTabByName(id);
     }
     return this.reader.isVisibleBySelector(ennioSelector);
+  }
+
+  /** Existence poll that treats transport blips as "not yet present". */
+  private async selectorExistsSafe(selector: MaestroSelector): Promise<boolean> {
+    try {
+      return await this.selectorExists(selector);
+    } catch {
+      return false;
+    }
+  }
+
+  /** Visibility poll that treats transport blips as "not yet visible". */
+  private async selectorVisibleSafe(selector: MaestroSelector): Promise<boolean> {
+    try {
+      if (await this.selectorVisible(selector)) return true;
+      // Text labels on TouchableOpacity often exist in the shadow tree
+      // before UIKit visibility / layout metrics agree (auth CTAs, tabs).
+      if (selector.text && !selector.id) {
+        return await this.selectorExistsSafe(selector);
+      }
+      // testID-only elements (LegendList, sheet rows) may mount in UIKit
+      // before Fabric visibility catches up.
+      if (selector.id && !selector.text) {
+        try {
+          const r = await this.client.send('getViewWindowFrame', { testID: selector.id });
+          if (r?.success === true) return true;
+        } catch {
+          return false;
+        }
+      }
+      return false;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -882,8 +1008,22 @@ class MaestroExecutor {
         await this.writer.dismissAlert();
         await this.waitCommit(TAP_NAV_SETTLE_MS);
       }
+      const idPresent = async (): Promise<boolean> => {
+        if (await this.selectorExists(selector)) return true;
+        // Fabric shadow tree can lag behind UIKit accessibilityIdentifier
+        // (auth CTAs, sheet triggers). getViewWindowFrame is socket-fast.
+        if (selector.id && !selector.text) {
+          try {
+            const r = await this.client.send('getViewWindowFrame', { testID: selector.id });
+            return r?.success === true;
+          } catch {
+            return false;
+          }
+        }
+        return false;
+      };
       await this.waitFor(
-        () => this.selectorExists(selector),
+        idPresent,
         opts.optional ? 500 : DEFAULT_VISIBLE_TIMEOUT,
         `Element not found: ${JSON.stringify(selector)}`,
       );
@@ -988,6 +1128,12 @@ class MaestroExecutor {
     this.lastTappedSelector = selector;
   }
 
+  private needsFormValidationSettle(): boolean {
+    const id = this.lastTappedSelector?.id;
+    if (!id || typeof id !== 'string') return false;
+    return id === 'thread-title' || id.startsWith('rules-input-');
+  }
+
   private async typeText(text: string, selector?: MaestroSelector): Promise<void> {
     const targetSelector = selector || this.lastTappedSelector;
     if (targetSelector) {
@@ -1079,10 +1225,46 @@ class MaestroExecutor {
    */
   private async checkCondition(condition: MaestroCondition): Promise<boolean> {
     if (condition.visible) {
-      return this.selectorVisible(normalizeSelector(condition.visible));
+      const selector = normalizeSelector(condition.visible);
+      // Single-shot for alert overlays; poll briefly for on-screen UI that
+      // mounts after launchApp / navigation transitions.
+      const pollForId = selector.id !== undefined && selector.text === undefined;
+      const pollForText = selector.text !== undefined && selector.id === undefined;
+      let result: boolean;
+      if (!pollForId && !pollForText) {
+        result = await this.selectorVisibleSafe(selector);
+      } else {
+        const deadline = Date.now() + WHEN_ID_VISIBLE_POLL_MS;
+        result = false;
+        while (Date.now() < deadline) {
+          if (await this.selectorVisibleSafe(selector)) {
+            result = true;
+            break;
+          }
+          await this.sleep(RETRY_POLL_MS);
+        }
+      }
+      if (this.debug) {
+        this.debugLog(
+          result
+            ? `saw ${this.formatSelector(selector)} — condition satisfied`
+            : `did not see ${this.formatSelector(selector)} — condition not satisfied`,
+        );
+      }
+      return result;
     }
     if (condition.notVisible) {
-      return !(await this.selectorVisible(normalizeSelector(condition.notVisible)));
+      const selector = normalizeSelector(condition.notVisible);
+      const visible = await this.selectorVisibleSafe(selector);
+      const result = !visible;
+      if (this.debug) {
+        this.debugLog(
+          result
+            ? `${this.formatSelector(selector)} is not visible — condition satisfied`
+            : `still see ${this.formatSelector(selector)} — condition not satisfied`,
+        );
+      }
+      return result;
     }
     return true;
   }
@@ -1090,14 +1272,18 @@ class MaestroExecutor {
   /**
    * Execute a runFlow command
    */
-  private async executeRunFlow(cmd: RunFlowCommand): Promise<void> {
+  private async executeRunFlow(raw: RunFlowCommand | string): Promise<void> {
+    const cmd: RunFlowCommand = typeof raw === 'string' ? { file: raw } : raw;
     // Check condition first
     if (cmd.when) {
       const conditionMet = await this.checkCondition(cmd.when);
       if (!conditionMet) {
-        // Condition not met, skip this flow
+        const target = cmd.file ?? (cmd.commands ? 'inline commands' : 'subflow');
+        this.debugLog(`skipping runFlow (${target}): ${this.formatCondition(cmd.when)}`);
         return;
       }
+      const target = cmd.file ?? (cmd.commands ? 'inline commands' : 'subflow');
+      this.debugLog(`running runFlow (${target}): ${this.formatCondition(cmd.when)}`);
     }
 
     // Execute inline commands or file
@@ -1319,6 +1505,7 @@ class MaestroExecutor {
           timeout,
           `Element not visible: ${JSON.stringify(selector)}`,
         );
+        this.debugLog(`assertVisible: saw ${this.formatSelector(selector)}`);
       } catch (e) {
         // iOS 26 sheet/screen-transition first-touch race: a tapByText
         // landed on a wrapper whose hit-test was eaten by the sheet's
@@ -1336,7 +1523,13 @@ class MaestroExecutor {
             timeout,
             `Element not visible: ${JSON.stringify(selector)}`,
           );
+          this.debugLog(`assertVisible: saw ${this.formatSelector(selector)} (after retap)`);
         } else {
+          if (this.debug) {
+            this.debugLog(
+              `assertVisible: did not see ${this.formatSelector(selector)} within ${timeout}ms`,
+            );
+          }
           throw e;
         }
       }
@@ -1356,6 +1549,7 @@ class MaestroExecutor {
           timeout,
           `Element still visible: ${JSON.stringify(selector)}`,
         );
+        this.debugLog(`assertNotVisible: ${this.formatSelector(selector)} is not visible`);
       } catch (e) {
         // Same recovery as assertVisible: the most common cause of an
         // element staying visible past `timeout` is the last tap landing
@@ -1373,7 +1567,15 @@ class MaestroExecutor {
             timeout,
             `Element still visible: ${JSON.stringify(selector)}`,
           );
+          this.debugLog(
+            `assertNotVisible: ${this.formatSelector(selector)} is not visible (after retap)`,
+          );
         } else {
+          if (this.debug) {
+            this.debugLog(
+              `assertNotVisible: still see ${this.formatSelector(selector)} after ${timeout}ms`,
+            );
+          }
           throw e;
         }
       }
@@ -1406,11 +1608,18 @@ class MaestroExecutor {
       // hooks as the user tapping "Paste" in the long-press menu —
       // real UIKit text insertion, but immune to keyboard layout.
       // No-op when nothing accepts paste (no focused responder),
-      // falls through to the HID path.
-      const paste = await this.client.send('pasteIntoFocusedField', { text });
+      // falls through to the HID path. Maestro sends `\n` as Return
+      // key events — paste can't fire onSubmitEditing for multiline forms.
+      // TanStack Form controlled fields need per-char HID so canSubmit updates.
+      const skipPaste = text.includes('\n') || this.needsFormValidationSettle();
+      const paste =
+        !skipPaste && (await this.client.send('pasteIntoFocusedField', { text }));
       if (paste?.success === true) {
         this.log(`inputText: via UIKit paste:`);
         await this.waitCommit(TAP_BACK_RECOVER_DELAY_MS);
+        if (this.needsFormValidationSettle()) {
+          await this.sleep(FORM_VALIDATION_DEBOUNCE_MS);
+        }
         return;
       }
       // No focused responder — the prior tap landed on a wrapper
@@ -1424,14 +1633,21 @@ class MaestroExecutor {
       // before falling back to layout-fragile HID typing.
       if (this.lastTappedSelector) {
         await this.tap(this.lastTappedSelector);
-        const retry = await this.client.send('pasteIntoFocusedField', { text });
+        const retry =
+          !skipPaste && (await this.client.send('pasteIntoFocusedField', { text }));
         if (retry?.success === true) {
           this.log(`inputText: via UIKit paste (after re-tap):`);
           await this.waitCommit(TAP_BACK_RECOVER_DELAY_MS);
+          if (this.needsFormValidationSettle()) {
+            await this.sleep(FORM_VALIDATION_DEBOUNCE_MS);
+          }
           return;
         }
       }
       await this.typeText(text);
+      if (this.needsFormValidationSettle()) {
+        await this.sleep(FORM_VALIDATION_DEBOUNCE_MS);
+      }
       return;
     }
 
@@ -1478,11 +1694,11 @@ class MaestroExecutor {
           const vPad = 80;
           let x1: number, y1: number, x2: number, y2: number;
           if (dir === 'left') {
-            x1 = screen.width - hPad;
+            x1 = cx;
             x2 = hPad;
             y1 = y2 = cy;
           } else if (dir === 'right') {
-            x1 = hPad;
+            x1 = cx;
             x2 = screen.width - hPad;
             y1 = y2 = cy;
           } else if (dir === 'up') {
@@ -1557,12 +1773,14 @@ class MaestroExecutor {
     }
 
     if ('runFlow' in cmd) {
-      if (cmd.runFlow.file) {
-        this.log(`runFlow: ${cmd.runFlow.file}`);
-      } else if (cmd.runFlow.when) {
-        this.log(`runFlow (conditional): ${JSON.stringify(cmd.runFlow.when)}`);
+      const runFlowCmd =
+        typeof cmd.runFlow === 'string' ? { file: cmd.runFlow } : cmd.runFlow;
+      if (runFlowCmd.file) {
+        this.log(`runFlow: ${runFlowCmd.file}`);
+      } else if (runFlowCmd.when) {
+        this.log(`runFlow (conditional): ${JSON.stringify(runFlowCmd.when)}`);
       }
-      await this.executeRunFlow(cmd.runFlow);
+      await this.executeRunFlow(runFlowCmd);
       return;
     }
 
@@ -1685,7 +1903,13 @@ class MaestroExecutor {
     if ('pressKey' in cmd) {
       const keyName = cmd.pressKey as string;
       this.log(`pressKey: ${keyName}`);
+      if (keyName.toLowerCase() === 'return' && (await this.reader.isAlertPresent())) {
+        await this.tryTapAlertButton('Not Now', 500);
+      }
       await this.writer.pressKey(this.lastTappedSelector?.id ?? null, keyName);
+      if (this.needsFormValidationSettle()) {
+        await this.sleep(FORM_VALIDATION_DEBOUNCE_MS);
+      }
       return;
     }
 
@@ -1878,6 +2102,7 @@ class MaestroExecutor {
           // the frame moving for a few hundred ms after the last
           // swipe, even when the on-screen + center checks pass.
           await this.sleep(300);
+          this.debugLog(`scrollUntilVisible: saw ${this.formatSelector(selector)}`);
           return;
         }
         // Selector is visible but center sits in the safe-tap-zone
@@ -1893,6 +2118,9 @@ class MaestroExecutor {
               stuckIters++;
               if (stuckIters >= 2) {
                 await this.sleep(300);
+                this.debugLog(
+                  `scrollUntilVisible: saw ${this.formatSelector(selector)} (best-effort position)`,
+                );
                 return;
               }
             } else {
@@ -1928,6 +2156,9 @@ class MaestroExecutor {
         await this.waitCommit(TAP_NAV_SETTLE_MS);
       }
     }
+    this.debugLog(
+      `scrollUntilVisible: did not find ${this.formatSelector(selector)} within ${timeout}ms`,
+    );
     throw new Error(`scrollUntilVisible timeout: ${JSON.stringify(selector)}`);
   }
 
@@ -2188,19 +2419,44 @@ class MaestroExecutor {
     this.log(`extendedWaitUntil: timeout=${timeout}ms`);
     if (visible) {
       const selector = normalizeSelector(visible);
-      await this.waitFor(
-        () => this.selectorVisible(selector),
-        timeout,
-        `Element not visible: ${JSON.stringify(selector)}`,
+      const startTime = Date.now();
+      let scrollAttempts = 0;
+      while (Date.now() - startTime < timeout) {
+        if (await this.selectorVisibleSafe(selector)) {
+          this.debugLog(`extendedWaitUntil: saw ${this.formatSelector(selector)}`);
+          return;
+        }
+        // Scroll while waiting for off-screen list rows (e.g. explore threads).
+        if (
+          scrollAttempts < 20 &&
+          Date.now() - startTime > 500 &&
+          selector.text &&
+          !selector.id
+        ) {
+          await this.scroll('down', 300);
+          scrollAttempts++;
+        }
+        await this.sleep(RETRY_POLL_MS);
+      }
+      this.debugLog(
+        `extendedWaitUntil: did not see ${this.formatSelector(selector)} within ${timeout}ms`,
       );
+      throw new Error(`Element not visible: ${JSON.stringify(selector)}`);
     }
     if (notVisible) {
       const selector = normalizeSelector(notVisible);
-      await this.waitFor(
-        () => this.selectorVisible(selector).then((v) => !v),
-        timeout,
-        `Element still visible: ${JSON.stringify(selector)}`,
+      const startTime = Date.now();
+      while (Date.now() - startTime < timeout) {
+        if (!(await this.selectorVisibleSafe(selector))) {
+          this.debugLog(`extendedWaitUntil: ${this.formatSelector(selector)} is not visible`);
+          return;
+        }
+        await this.sleep(RETRY_POLL_MS);
+      }
+      this.debugLog(
+        `extendedWaitUntil: still see ${this.formatSelector(selector)} after ${timeout}ms`,
       );
+      throw new Error(`Element still visible: ${JSON.stringify(selector)}`);
     }
   }
 
@@ -2393,6 +2649,8 @@ class MaestroExecutor {
       // instead of bubbling. Lets flows like `- tapOn: { id: cookie-banner-x, optional: true }`
       // tolerate missing UI without an explicit runFlow + when wrapper.
       const optional = isOptional(cmd);
+      this.stepIndex++;
+      this.debugLog(`step ${this.stepIndex}: ${this.summarizeCommand(cmd)}`);
       try {
         await this.executeCommand(cmd);
       } catch (err) {
@@ -2400,10 +2658,15 @@ class MaestroExecutor {
         // `assertVisible` retry path doesn't re-tap a stale selector
         // from the failed command.
         this.lastTappedSelector = null;
+        const errMsg = (err as Error).message;
         if (optional) {
           const cmdName = typeof cmd === 'string' ? cmd : Object.keys(cmd as object)[0];
-          this.log(`  (optional ${cmdName} failed, continuing): ${(err as Error).message}`);
+          this.debugLog(
+            `optional ${cmdName}: did not run — ${errMsg}`,
+          );
+          this.log(`  (optional ${cmdName} failed, continuing): ${errMsg}`);
         } else {
+          this.debugLog(`step ${this.stepIndex} failed — ${errMsg}`);
           throw err;
         }
       }

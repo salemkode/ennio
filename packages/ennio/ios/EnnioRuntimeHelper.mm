@@ -2657,84 +2657,38 @@ bool EnnioRuntimeHelper::fireTapByTestID(const std::string& testID) {
 
     void (^block)(void) = ^{
         UIView* view = findViewByTestIDInAllWindows(tid);
-        if (!view || !view.window) return;
+        if (!view || !view.window) {
+            NSLog(@"[Ennio][fireTap] testID=%@ not found or no window", tid);
+            return;
+        }
+        NSLog(@"[Ennio][fireTap] testID=%@ class=%@ window=YES", tid, NSStringFromClass([view class]));
+
+        // Same activation cascade as tapByLabel: state-drive the view's
+        // UITapGestureRecognizer / UIControl actions, then synthesised
+        // touch at centre. Avoids blasting every recognizer in the subtree
+        // (screen-edge pans, RCTSurfaceTouchHandler) which returns ok
+        // without firing the target onPress.
+        UIView* cursor = view;
+        while (cursor) {
+            if (fireActivation(cursor)) {
+                ok = true;
+                return;
+            }
+            cursor = cursor.superview;
+        }
+        // RNGH Pressable attaches RNNativeViewGestureRecognizer on the
+        // host view; fireActivation's synthesizeTouch can return YES without
+        // firing onPress. Drive the handler recognizers directly.
         UIWindow* window = view.window;
         CGPoint center = CGPointMake(CGRectGetMidX(view.bounds), CGRectGetMidY(view.bounds));
         CGPoint inWindow = [view convertPoint:center toView:window];
-        NSLog(@"[Ennio][fireTap] testID=%@ class=%@ window=YES", tid, NSStringFromClass([view class]));
-
-        // Path 1: nearest enabled UIControl ancestor → fire
-        // touchUpInside actions. Covers UIButton, UISwitch, UISlider,
-        // and RNGestureHandlerButton (RNGH BaseButton / pressto) —
-        // RNGH does register UIControl actions even though its public
-        // path is the gesture handler module. If allTargets is empty
-        // for this UIControl, fall through (some custom UIControls
-        // don't use action targets).
-        for (UIView* cursor = view; cursor != nil; cursor = cursor.superview) {
-            if (![cursor isKindOfClass:[UIControl class]]) continue;
-            UIControl* ctrl = (UIControl*)cursor;
-            if (!ctrl.enabled) continue;
-            NSSet* targets = [ctrl allTargets];
-            if (targets.count == 0) continue;
-            NSLog(@"[Ennio][fireTap] sendActions on %@ targets=%lu",
-                  NSStringFromClass([ctrl class]), (unsigned long)targets.count);
-            [ctrl sendActionsForControlEvents:UIControlEventTouchUpInside];
+        UIApplication* app = [UIApplication sharedApplication];
+        UIEvent* event = [app respondsToSelector:@selector(_touchesEvent)] ? [app _touchesEvent] : nil;
+        if (tryRNGestureHandlerDirect(view, window, event, inWindow)) {
             ok = true;
             return;
         }
-
-        // Path 2: drive every gesture recogniser in the view +
-        // ancestor chain by hand. RCTSurfaceTouchHandler (the
-        // RCTRootView-level recogniser RN uses to feed its responder
-        // system) recognises a tap → JS sees onResponderRelease →
-        // Pressability fires onPress. RNNativeViewGestureRecognizer
-        // (RNGH BaseButton/pressto) recognises a tap → JS sees
-        // onActivated → RNGH BaseButton fires onPress. Bypasses
-        // UIWindow.sendEvent so UIPresentationController's
-        // mid-transition gating can't drop the touch. Calling
-        // touchesBegan:/touchesEnded: directly on the recogniser is
-        // the supported entry point — UIKit dispatches there itself
-        // during normal events.
-        NSArray<UIGestureRecognizer*>* recognizers = collectRecognizersDeepestFirst(view);
-        NSLog(@"[Ennio][fireTap] recognizers count=%lu", (unsigned long)recognizers.count);
-        for (UIGestureRecognizer* r in recognizers) {
-            NSLog(@"[Ennio][fireTap]   - %@ enabled=%d", NSStringFromClass([r class]), r.enabled);
-        }
-        if (recognizers.count > 0) {
-            UIApplication* app = [UIApplication sharedApplication];
-            UIEvent* event = [app respondsToSelector:@selector(_touchesEvent)] ? [app _touchesEvent] : nil;
-
-            UITouch* touchBegan = makeSynthTouch(view, window, inWindow, UITouchPhaseBegan);
-            NSSet* setBegan = [NSSet setWithObject:touchBegan];
-            for (UIGestureRecognizer* r in recognizers) {
-                @try { [r touchesBegan:setBegan withEvent:event]; }
-                @catch (NSException* e) { NSLog(@"[Ennio] touchesBegan throw: %@", e.reason); }
-            }
-            // Spin the runloop one tick so recognisers can transition
-            // from Possible → Began (some need a frame to commit
-            // intermediate state before they accept Ended).
-            [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.020]];
-
-            UITouch* touchEnded = makeSynthTouch(view, window, inWindow, UITouchPhaseEnded);
-            NSSet* setEnded = [NSSet setWithObject:touchEnded];
-            for (UIGestureRecognizer* r in recognizers) {
-                @try { [r touchesEnded:setEnded withEvent:event]; }
-                @catch (NSException* e) { NSLog(@"[Ennio] touchesEnded throw: %@", e.reason); }
-            }
-            ok = true;
-            return;
-        }
-
-        // Path 3: accessibilityActivate. Last resort because it only
-        // fires onPress for views that explicitly opt in (Pressable
-        // with accessibilityRole="button"). For the rest it returns
-        // YES but does nothing visible. Returning ok=true here is
-        // best-effort; the caller's assertVisible/assertNotVisible will
-        // catch a no-op.
-        if ([view accessibilityActivate]) {
-            ok = true;
-            return;
-        }
+        NSLog(@"[Ennio][fireTap] no activation path on '%@' or ancestors", tid);
     };
 
     if ([NSThread isMainThread]) block(); else dispatchSyncMainWithTimeout(block);

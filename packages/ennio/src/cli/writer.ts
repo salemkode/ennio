@@ -404,6 +404,18 @@ export class NitroWriter implements Writer {
   }
 
   async tap(testID: string): Promise<boolean> {
+    // TouchableOpacity / Pressable often expose testID on a wrapper whose
+    // inner Text receives HID hits without firing onPress. Native
+    // fireTap drives UIControl actions and gesture recognizers directly.
+    try {
+      const native = await this.send('fireTapByTestID', { testID });
+      if (native?.success === true) {
+        await this.client.waitForCommit(150);
+        return true;
+      }
+    } catch {
+      /* fall through to HID */
+    }
     // Batched JSI prepare: stable-coord poll + auto-scroll + UIMenu
     // check in one CDP round trip. ~5-10× fewer round trips than the
     // old CLI-side layoutCenter loop. Actuation stays on idb HID —
@@ -598,7 +610,9 @@ export class NitroWriter implements Writer {
     // Per-char onChangeText validators still see the change (paste
     // dispatches a single insertText), so masked-input formatters
     // (phone, expiry, etc.) still run. Keyboard-layout independent.
-    if (testID) {
+    // Skip paste when text contains `\n` — Maestro sends Return key
+    // events for newlines. Per-char HID is still required for `\n`.
+    if (testID && !text.includes('\n')) {
       await this.setClipboard(text);
       const r = await this.send('pasteFromClipboard', { testID });
       if (r?.success === true) {
@@ -870,6 +884,18 @@ export class NitroWriter implements Writer {
     // labelled views inside the app process). Tap the resolved coord
     // via idb HID — real touch, real hit-test, real responder chain.
     await idb.ensureCompanion();
+    // 0) Native label activation — drives UIControl / gesture recognizers
+    // on the matched view + ancestors. Required for RNGH Pressable rows
+    // (demo-account sheet) where HID hits inner Text without onPress.
+    try {
+      const native = await this.send('tapByLabel', { text });
+      if (native?.success === true) {
+        await this.client.waitForCommit(150);
+        return true;
+      }
+    } catch {
+      /* fall through */
+    }
     // 1) UITabBarController shortcut FIRST. When the text matches a
     //    tab name, this is unambiguous and fast — switches the active
     //    tab directly. Avoids the failure mode where AX-label search

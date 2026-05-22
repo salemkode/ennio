@@ -1,0 +1,4 @@
+appId: com.ennio.example
+---
+- runFlow: runflow-shorthand-child.yaml
+- assertTrue: ${CHILD_RAN === true}

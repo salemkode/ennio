@@ -448,6 +448,14 @@ static const std::unordered_map<std::string, HandlerFn>& commandHandlers() {
                 ::ennio::json::parseDouble(req.payload, "x"),
                 ::ennio::json::parseDouble(req.payload, "y"));
         }},
+        { "fireTapByTestID", [](HybridEnnio*, const auto& req, auto& r) {
+            r.success = ::ennio::EnnioRuntimeHelper::getInstance().fireTapByTestID(
+                ::ennio::json::parseString(req.payload, "testID"));
+        }},
+        { "tapByLabel", [](HybridEnnio*, const auto& req, auto& r) {
+            r.success = ::ennio::EnnioRuntimeHelper::getInstance().tapByLabel(
+                ::ennio::json::parseString(req.payload, "text"));
+        }},
         { "swipeAtPoints", [](HybridEnnio*, const auto& req, auto& r) {
             // Window-coordinate pan: (x1,y1)→(x2,y2) over durationMs.
             // Replaces idb HID swipe — used for cross-screen drags and

@@ -14,6 +14,8 @@ export type Flags = {
   port?: number;
   verbose?: boolean;
   trace?: boolean;
+  /** Step-by-step visibility / condition narrative. Default on in this branch; use --no-debug to disable. */
+  debug?: boolean;
   help?: boolean;
   output?: string;
 };
@@ -25,7 +27,7 @@ export type ParsedArgs = {
 };
 
 const STRING_FLAGS = new Set(['port', 'output']);
-const BOOL_FLAGS = new Set(['verbose', 'trace', 'help']);
+const BOOL_FLAGS = new Set(['verbose', 'trace', 'debug', 'help']);
 
 export function parseArgs(argv: string[]): ParsedArgs {
   const positional: string[] = [];
@@ -34,6 +36,10 @@ export function parseArgs(argv: string[]): ParsedArgs {
     const a = argv[i];
     if (a === '-v') {
       flags.verbose = true;
+      continue;
+    }
+    if (a === '--no-debug') {
+      flags.debug = false;
       continue;
     }
     if (a === '-h') {

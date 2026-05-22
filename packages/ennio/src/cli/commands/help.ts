@@ -15,7 +15,8 @@ Usage:
 
 Common options:
   --port=<n>     WebSocket port (default 9876)
-  --verbose, -v  detailed command execution
+  --debug        step-by-step visibility narrative (default on; use --no-debug to disable)
+  --verbose, -v  detailed command execution with timing
   --trace        emit a trace marker between commands
 
 Environment:
@@ -29,7 +30,7 @@ const PER_COMMAND: Record<string, string> = {
 Runs Maestro YAML flows against the booted iOS simulator. If the app
 isn't running, ennio auto-launches it via the YAML's \`appId\`.
 
-Options: --port, --verbose, --trace`,
+Options: --port, --debug, --no-debug, --verbose, --trace`,
   hierarchy: `ennio hierarchy
 
 Dumps the in-app Fabric shadow tree as JSON. Useful for figuring out

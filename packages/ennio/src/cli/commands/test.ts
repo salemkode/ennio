@@ -66,7 +66,7 @@ async function runTestFile(
   writer: Writer,
   reader: Reader,
   filePath: string,
-  options: { verbose?: boolean; trace?: boolean; port?: number },
+  options: { verbose?: boolean; trace?: boolean; debug?: boolean; port?: number },
 ): Promise<TestFileResultWithClient> {
   const fileName = basename(filePath);
   console.log(`▸ ${fileName}`);
@@ -86,6 +86,8 @@ async function runTestFile(
 export async function runTestCommand(positional: string[], flags: Flags): Promise<number> {
   const verbose = flags.verbose ?? false;
   const trace = flags.trace ?? false;
+  // Debug narrative is on by default in this branch — pass --no-debug to silence.
+  const debug = flags.debug ?? true;
 
   if (positional.length === 0) {
     console.error('Usage: ennio test <flow.yaml | dir | glob> [options]');
@@ -122,7 +124,7 @@ export async function runTestCommand(positional: string[], flags: Flags): Promis
   let totalFailed = 0;
   try {
     for (const file of files) {
-      const r = await runTestFile(currentClient, writer, reader, file, { verbose, trace });
+      const r = await runTestFile(currentClient, writer, reader, file, { verbose, trace, debug });
       totalPassed += r.passed;
       totalFailed += r.failed;
       if (r.client) {

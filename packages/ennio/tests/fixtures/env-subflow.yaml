@@ -1,0 +1,5 @@
+appId: com.ennio.example
+---
+- evalScript: ${PASSED_DEMO_ID = DEMO_ACCOUNT_ID}
+- assertTrue: ${DEMO_ACCOUNT_ID === 'demo-account-aboflah'}
+- assertTrue: ${typeof output.threadTitle === 'string' && output.threadTitle.length > 0}

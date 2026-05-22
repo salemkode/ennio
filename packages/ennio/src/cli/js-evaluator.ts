@@ -308,8 +308,16 @@ export function preprocessValue(value: unknown, context: JsContext): unknown {
 }
 
 /**
- * Preprocess a Maestro command, evaluating all ${} expressions in string values
+ * Preprocess a Maestro command, evaluating all ${} expressions in string values.
+ * evalScript / assertTrue carry raw JS — preprocessing their bodies would
+ * evaluate assignments (e.g. `${x = foo-bar}`) into strings and break execution.
  */
 export function preprocessCommand<T>(cmd: T, context: JsContext): T {
+  if (cmd && typeof cmd === 'object' && !Array.isArray(cmd)) {
+    const obj = cmd as Record<string, unknown>;
+    if ('evalScript' in obj || 'assertTrue' in obj) {
+      return cmd;
+    }
+  }
   return preprocessValue(cmd, context) as T;
 }

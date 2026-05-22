@@ -1121,17 +1121,20 @@ class MaestroExecutor {
 
       const subflow = parseMaestroFile(subflowPath);
 
-      // Merge subflow's own `env:` block into the JS context for the
-      // duration of the subflow. Maestro semantics: a subflow can declare
-      // its own env that scopes to its body, falling back to (and
-      // overriding) the parent's env. We snapshot the previous values so
-      // we can restore them when the subflow exits — this keeps the
-      // parent flow's interpolation intact after the subflow returns.
-      const subflowEnv = subflow.env;
+      // Merge env for the subflow body:
+      // 1) subflow file `env:` defaults
+      // 2) runFlow `env:` overrides (parent -> child passthrough)
+      // Snapshot + restore so parent interpolation stays intact after return.
+      const envToApply: Record<string, string> = { ...(subflow.env || {}) };
+      if (cmd.env) {
+        for (const [key, value] of Object.entries(cmd.env)) {
+          envToApply[key] = value;
+        }
+      }
       const envSnapshot: Record<string, unknown> = {};
       const envKeys: string[] = [];
-      if (subflowEnv) {
-        for (const [key, value] of Object.entries(subflowEnv)) {
+      if (Object.keys(envToApply).length > 0) {
+        for (const [key, value] of Object.entries(envToApply)) {
           envSnapshot[key] = (this.jsContext as Record<string, unknown>)[key];
           envKeys.push(key);
           (this.jsContext as Record<string, unknown>)[key] = value;
@@ -1229,8 +1232,15 @@ class MaestroExecutor {
     }
 
     if ('runScript' in processedCmd) {
-      const runCmd = (processedCmd as { runScript: { file: string; env?: Record<string, string> } })
-        .runScript;
+      const raw = (
+        processedCmd as {
+          runScript: string | { file: string; env?: Record<string, string> };
+        }
+      ).runScript;
+      const runCmd = typeof raw === 'string' ? { file: raw } : raw;
+      if (!runCmd.file) {
+        throw new Error('runScript: missing file path');
+      }
       this.log(`runScript: ${runCmd.file}`);
       // Merge flow-level env with per-command env (per-command wins).
       const mergedEnv = { ...this.flowEnv, ...(runCmd.env || {}) };

@@ -61,6 +61,7 @@ function parseMaestroPoint(p: string | { x: number | string; y: number | string 
 const DEFAULT_TIMEOUT = 3000;
 const DEFAULT_VISIBLE_TIMEOUT = 5000;
 const DEFAULT_RETRY_INTERVAL = 30;
+const WHEN_ID_VISIBLE_POLL_MS = 3000; // runFlow `when: visible: id:` — data-driven UI may mount after launchApp idle.
 const DEFAULT_RECONNECT_TIMEOUT = 30000;
 
 // Per-command timing constants. All in ms unless noted. Pulled from the
@@ -74,6 +75,7 @@ const KEYBOARD_DISMISS_SETTLE_MS = 120; // Settle after hideKeyboard before re-t
 const POST_LAUNCH_SETTLE_MS = 400; // Wait for sim teardown after clearState before relaunch.
 const POST_LAUNCH_IDLE_BUDGET_MS = 1500; // First waitForIdle after a launch.
 const TYPE_TEXT_IDLE_BUDGET_MS = 600; // Drain RN bridge after typeText so onChangeText commits before the next tap reads `value`.
+const FORM_VALIDATION_DEBOUNCE_MS = 550; // TanStack Form / similar onChangeAsyncDebounceMs — paste is instant so the next tapOn can race canSubmit.
 const POST_LAUNCH_SHADOW_COMMIT_MS = 250; // First shadow-tree commit settle after reconnect.
 const RETRY_POLL_MS = 100; // Predicate retry tick for waitFor / extendedWaitUntil.
 const POINT_TAP_SETTLE_MS = 60; // Quick settle after tapAt — no tab-nav animation.
@@ -799,6 +801,22 @@ class MaestroExecutor {
         }
       }
     }
+    // Text-only: native tapByLabel walks ancestors and fires
+    // UIControl/UIGesture activation — required for header buttons
+    // (TouchableOpacity) where HID hits the inner Text label only.
+    if (selector.text && !selector.id) {
+      try {
+        const lbl = await this.client.send('tapByLabel', { text: selector.text });
+        if (lbl?.success === true) {
+          this.log(`tap: ${JSON.stringify(selector)} via tapByLabel`);
+          this.lastTappedSelector = selector;
+          await this.waitCommit(TAP_NAV_SETTLE_MS);
+          return;
+        }
+      } catch {
+        /* fall through */
+      }
+    }
     // Text-only selectors: try native UISearchBar focus. The RNScreens
     // UISearchBar isn't in the React view tree — placeholder text
     // matches don't resolve via the shadow-tree text walk and the
@@ -988,6 +1006,26 @@ class MaestroExecutor {
     this.lastTappedSelector = selector;
   }
 
+  private async inputTextViaPaste(text: string): Promise<boolean> {
+    // Maestro treats `\n` in inputText as Return-key presses, not pasted
+    // newline characters. UIKit paste alone won't fire onSubmitEditing /
+    // onKeyPress handlers that multiline RN fields rely on to advance.
+    const segments = text.split('\n');
+    let pasted = await this.client.send('pasteIntoFocusedField', { text: segments[0] ?? '' });
+    if (pasted?.success !== true) return false;
+    await this.waitCommit(TAP_BACK_RECOVER_DELAY_MS);
+    for (let i = 1; i < segments.length; i++) {
+      await this.writer.pressKey(this.lastTappedSelector?.id ?? null, 'Enter');
+      await this.waitCommit(TAP_BACK_RECOVER_DELAY_MS);
+      if (segments[i].length > 0) {
+        pasted = await this.client.send('pasteIntoFocusedField', { text: segments[i] });
+        if (pasted?.success !== true) return true;
+        await this.waitCommit(TAP_BACK_RECOVER_DELAY_MS);
+      }
+    }
+    return true;
+  }
+
   private async typeText(text: string, selector?: MaestroSelector): Promise<void> {
     const targetSelector = selector || this.lastTappedSelector;
     if (targetSelector) {
@@ -1079,7 +1117,20 @@ class MaestroExecutor {
    */
   private async checkCondition(condition: MaestroCondition): Promise<boolean> {
     if (condition.visible) {
-      return this.selectorVisible(normalizeSelector(condition.visible));
+      const selector = normalizeSelector(condition.visible);
+      // Text/alert `when` checks stay single-shot (overlay either present or not).
+      // testID `when` polls briefly — lists like explore-threads-list mount
+      // after auth restore even once waitForIdle has returned.
+      const pollForId = selector.id !== undefined && selector.text === undefined;
+      if (!pollForId) {
+        return this.selectorVisible(selector);
+      }
+      const start = Date.now();
+      while (Date.now() - start < WHEN_ID_VISIBLE_POLL_MS) {
+        if (await this.selectorVisible(selector)) return true;
+        await this.sleep(RETRY_POLL_MS);
+      }
+      return false;
     }
     if (condition.notVisible) {
       return !(await this.selectorVisible(normalizeSelector(condition.notVisible)));
@@ -1121,17 +1172,20 @@ class MaestroExecutor {
 
       const subflow = parseMaestroFile(subflowPath);
 
-      // Merge subflow's own `env:` block into the JS context for the
-      // duration of the subflow. Maestro semantics: a subflow can declare
-      // its own env that scopes to its body, falling back to (and
-      // overriding) the parent's env. We snapshot the previous values so
-      // we can restore them when the subflow exits — this keeps the
-      // parent flow's interpolation intact after the subflow returns.
-      const subflowEnv = subflow.env;
+      // Merge env for the subflow body:
+      // 1) subflow file `env:` defaults
+      // 2) runFlow `env:` overrides (parent → child passthrough)
+      // Snapshot + restore so parent interpolation stays intact after return.
+      const envToApply: Record<string, string> = { ...(subflow.env || {}) };
+      if (cmd.env) {
+        for (const [key, value] of Object.entries(cmd.env)) {
+          envToApply[key] = value;
+        }
+      }
       const envSnapshot: Record<string, unknown> = {};
       const envKeys: string[] = [];
-      if (subflowEnv) {
-        for (const [key, value] of Object.entries(subflowEnv)) {
+      if (Object.keys(envToApply).length > 0) {
+        for (const [key, value] of Object.entries(envToApply)) {
           envSnapshot[key] = (this.jsContext as Record<string, unknown>)[key];
           envKeys.push(key);
           (this.jsContext as Record<string, unknown>)[key] = value;
@@ -1195,27 +1249,32 @@ class MaestroExecutor {
         }
         return;
       }
-      const STRING_FORM_COMMANDS = new Set([
-        'hideKeyboard',
-        'pasteText',
-        'launchApp',
-        'clearState',
-        'stopApp',
-        'killApp',
-        'dismissAlert',
-        'clearKeychain',
-        'stopRecording',
-        'inputRandomEmail',
-        'inputRandomNumber',
-        'inputRandomText',
-        'inputRandomPersonName',
-        'toggleAirplaneMode',
-        'eraseText',
-      ]);
-      if (!STRING_FORM_COMMANDS.has(processedCmd)) {
-        throw new Error(`Unknown string command: ${processedCmd}`);
+      if (processedCmd === 'scroll') {
+        // Maestro bare `- scroll` defaults to scrolling down one viewport.
+        processedCmd = { scroll: { direction: 'DOWN' } } as MaestroCommand;
+      } else {
+        const STRING_FORM_COMMANDS = new Set([
+          'hideKeyboard',
+          'pasteText',
+          'launchApp',
+          'clearState',
+          'stopApp',
+          'killApp',
+          'dismissAlert',
+          'clearKeychain',
+          'stopRecording',
+          'inputRandomEmail',
+          'inputRandomNumber',
+          'inputRandomText',
+          'inputRandomPersonName',
+          'toggleAirplaneMode',
+          'eraseText',
+        ]);
+        if (!STRING_FORM_COMMANDS.has(processedCmd)) {
+          throw new Error(`Unknown string command: ${processedCmd}`);
+        }
+        processedCmd = { [processedCmd]: {} } as MaestroCommand;
       }
-      processedCmd = { [processedCmd]: {} } as MaestroCommand;
     }
     if (typeof processedCmd !== 'object') {
       throw new Error(`Unsupported command type: ${typeof processedCmd}`);
@@ -1229,8 +1288,15 @@ class MaestroExecutor {
     }
 
     if ('runScript' in processedCmd) {
-      const runCmd = (processedCmd as { runScript: { file: string; env?: Record<string, string> } })
-        .runScript;
+      const raw = (
+        processedCmd as {
+          runScript: string | { file: string; env?: Record<string, string> };
+        }
+      ).runScript;
+      const runCmd = typeof raw === 'string' ? { file: raw } : raw;
+      if (!runCmd.file) {
+        throw new Error('runScript: missing file path');
+      }
       this.log(`runScript: ${runCmd.file}`);
       // Merge flow-level env with per-command env (per-command wins).
       const mergedEnv = { ...this.flowEnv, ...(runCmd.env || {}) };
@@ -1374,54 +1440,64 @@ class MaestroExecutor {
     if ('inputText' in cmd) {
       const text = cmd.inputText;
       this.log(`inputText: "${text}"`);
-      // Native UISearchBar fast-path: RNScreens headerSearchBarOptions
-      // wraps a UISearchBar that idb HID can't reach reliably on iOS 26
-      // simulator. When a search bar is the current first responder,
-      // append directly via the bar's delegate textDidChange so React
-      // state mirrors the input. No-op when no bar is focused — falls
-      // through to the regular HID typeText path.
-      const sbar = await this.client.send('appendSearchBarText', { text });
-      if (sbar?.success === true) {
-        this.log(`inputText: via UISearchBar delegate`);
-        await this.waitCommit(TAP_BACK_RECOVER_DELAY_MS);
-        return;
-      }
-      // Layout-independent text-entry fast-path. The idb HID `text`
-      // op sends US scan codes that the iOS simulator re-encodes
-      // through its active keyboard locale — Italian / German /
-      // French sims turn '-' into '\'' and '@' into '"', garbling
-      // email and password fields. The system pasteboard + UIKit's
-      // canonical `paste:` responder action goes through the same
-      // textField:shouldChangeCharactersInRange: + editingChanged
-      // hooks as the user tapping "Paste" in the long-press menu —
-      // real UIKit text insertion, but immune to keyboard layout.
-      // No-op when nothing accepts paste (no focused responder),
-      // falls through to the HID path.
-      const paste = await this.client.send('pasteIntoFocusedField', { text });
-      if (paste?.success === true) {
-        this.log(`inputText: via UIKit paste:`);
-        await this.waitCommit(TAP_BACK_RECOVER_DELAY_MS);
-        return;
-      }
-      // No focused responder — the prior tap landed on a wrapper
-      // view, not a UITextField. Happens on iOS 26 sheets where the
-      // sheet's pan recogniser races ahead of the inner input's
-      // hit-test acceptance for the first tap after presentation:
-      // `pollStableLabelFrame` returns a stable frame for an outer
-      // Pressable that happens to satisfy the label search, the tap
-      // lands on the wrapper, no field focuses. Re-tap the last
-      // selector once (sheet is settled by now) and retry paste
-      // before falling back to layout-fragile HID typing.
-      if (this.lastTappedSelector) {
-        await this.tap(this.lastTappedSelector);
-        const retry = await this.client.send('pasteIntoFocusedField', { text });
-        if (retry?.success === true) {
-          this.log(`inputText: via UIKit paste (after re-tap):`);
+      const hasNewlines = text.includes('\n');
+      const focusedId = this.lastTappedSelector?.id;
+      const skipPasteForControlledFormField =
+        focusedId === 'thread-title' ||
+        (typeof focusedId === 'string' && focusedId.startsWith('rules-input-'));
+      // Maestro sends `\n` as Return-key events. UIKit paste inserts a
+      // literal newline character but won't fire onSubmitEditing / onKeyPress
+      // handlers that RN forms use to advance (e.g. "Press enter to add rule").
+      // Controlled TanStack Form fields (`value={field.state.value}`) also
+      // need onChangeText to flip canSubmit before a header Submit/Create tap.
+      if (!hasNewlines && !skipPasteForControlledFormField) {
+        // Native UISearchBar fast-path: RNScreens headerSearchBarOptions
+        // wraps a UISearchBar that idb HID can't reach reliably on iOS 26
+        // simulator. When a search bar is the current first responder,
+        // append directly via the bar's delegate textDidChange so React
+        // state mirrors the input. No-op when no bar is focused — falls
+        // through to the regular HID typeText path.
+        const sbar = await this.client.send('appendSearchBarText', { text });
+        if (sbar?.success === true) {
+          this.log(`inputText: via UISearchBar delegate`);
           await this.waitCommit(TAP_BACK_RECOVER_DELAY_MS);
           return;
         }
+        // Layout-independent text-entry fast-path. The idb HID `text`
+        // op sends US scan codes that the iOS simulator re-encodes
+        // through its active keyboard locale — Italian / German /
+        // French sims turn '-' into '\'' and '@' into '"', garbling
+        // email and password fields. The system pasteboard + UIKit's
+        // canonical `paste:` responder action goes through the same
+        // textField:shouldChangeCharactersInRange: + editingChanged
+        // hooks as the user tapping "Paste" in the long-press menu —
+        // real UIKit text insertion, but immune to keyboard layout.
+        // No-op when nothing accepts paste (no focused responder),
+        // falls through to the HID path.
+        const pasteOk = await this.inputTextViaPaste(text);
+        if (pasteOk) {
+          this.log(`inputText: via UIKit paste:`);
+        } else if (this.lastTappedSelector) {
+          await this.tap(this.lastTappedSelector);
+          const retryOk = await this.inputTextViaPaste(text);
+          if (retryOk) {
+            this.log(`inputText: via UIKit paste (after re-tap):`);
+          } else {
+            await this.typeText(text);
+          }
+        } else {
+          await this.typeText(text);
+        }
+      } else {
+        await this.typeText(text);
       }
-      await this.typeText(text);
+      try {
+        await this.client.waitForIdle(TYPE_TEXT_IDLE_BUDGET_MS);
+      } catch {
+        /* tolerate */
+      }
+      await this.sleep(FORM_VALIDATION_DEBOUNCE_MS);
+      await this.writer.hideKeyboard();
       return;
     }
 
@@ -1547,12 +1623,14 @@ class MaestroExecutor {
     }
 
     if ('runFlow' in cmd) {
-      if (cmd.runFlow.file) {
-        this.log(`runFlow: ${cmd.runFlow.file}`);
-      } else if (cmd.runFlow.when) {
-        this.log(`runFlow (conditional): ${JSON.stringify(cmd.runFlow.when)}`);
+      const raw = cmd.runFlow as RunFlowCommand | string;
+      const runFlowCmd: RunFlowCommand = typeof raw === 'string' ? { file: raw } : raw;
+      if (runFlowCmd.file) {
+        this.log(`runFlow: ${runFlowCmd.file}`);
+      } else if (runFlowCmd.when) {
+        this.log(`runFlow (conditional): ${JSON.stringify(runFlowCmd.when)}`);
       }
-      await this.executeRunFlow(cmd.runFlow);
+      await this.executeRunFlow(runFlowCmd);
       return;
     }
 
@@ -2178,11 +2256,22 @@ class MaestroExecutor {
     this.log(`extendedWaitUntil: timeout=${timeout}ms`);
     if (visible) {
       const selector = normalizeSelector(visible);
-      await this.waitFor(
-        () => this.selectorVisible(selector),
-        timeout,
-        `Element not visible: ${JSON.stringify(selector)}`,
-      );
+      const startTime = Date.now();
+      let scrollAttempts = 0;
+      while (Date.now() - startTime < timeout) {
+        if (await this.selectorVisible(selector)) return;
+        // Maestro scrolls while waiting for off-screen list rows. Without
+        // this, a freshly created thread at the bottom of a long feed never
+        // becomes visible to a static poll.
+        if (scrollAttempts < 20 && Date.now() - startTime > 500) {
+          await this.scroll('down', 300);
+          await this.waitCommit(TAP_NAV_SETTLE_MS);
+          scrollAttempts++;
+        } else {
+          await this.sleep(RETRY_POLL_MS);
+        }
+      }
+      throw new Error(`Element not visible: ${JSON.stringify(selector)}`);
     }
     if (notVisible) {
       const selector = normalizeSelector(notVisible);

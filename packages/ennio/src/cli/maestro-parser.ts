@@ -118,6 +118,12 @@ export interface RunFlowCommand {
   file?: string;
   when?: MaestroCondition;
   commands?: MaestroCommand[];
+  /**
+   * Per-invocation env overrides passed from the parent flow into a
+   * subflow file. Values support `${}` interpolation against the
+   * parent's JS context (including `output.*` from runScript).
+   */
+  env?: Record<string, string>;
 }
 
 export interface MaestroFlow {

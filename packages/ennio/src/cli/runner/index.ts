@@ -24,7 +24,8 @@
 //   travel / setLocation / setPermissions
 //   recordVideo / startRecording
 
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
+import { runInContext } from 'node:vm';
 
 import { dirname, resolve } from 'node:path';
 
@@ -32,9 +33,16 @@ import {
   MaestroCommand,
   MaestroFlow,
   MaestroSelector,
+  RunFlowCommand,
   normalizeSelector,
   parseMaestroFile,
 } from '../maestro-parser';
+import {
+  createContext as createJsContext,
+  evalScript as jsEvalScript,
+  preprocessCommand,
+  runScript as jsRunScript,
+} from '../js-evaluator';
 import { EnnioSocketClient } from '../socket-client';
 import {
   tap as hidTap,
@@ -52,7 +60,6 @@ import {
   POST_TAP_SETTLE_MS,
   RunContext,
   RunResult,
-  interpolate,
   recordPhase,
   sleep,
   timedAsync,
@@ -61,33 +68,6 @@ import { captureHash, captureReactTs, findOnce, resolveCenter, resolveRect } fro
 import { execTapOn } from './tap';
 import { isVisible, waitUntilNotVisible, waitUntilVisible } from './visibility';
 import { clearStateAndRelaunch, relaunchAndReconnect } from './lifecycle';
-
-// =====================================================================
-// runScript — Maestro JS sandbox
-// =====================================================================
-//
-// Maestro's runScript executes JS in a GraalVM sandbox with custom
-// globals: http.{get,post,put,delete}, output (mutable bag), json
-// (synchronous parse), env (script-step env block). Bluesky's e2e
-// flows lean on this to bootstrap mock data and write the result
-// into output.X for later steps to interpolate via ${output.X}.
-//
-// We can't ship GraalVM, but Node's `vm` module + a tiny curl-backed
-// synchronous http shim covers the surface area Bluesky actually
-// uses (one http.post per setupServer.js invocation).
-//
-// Limitations:
-// - http calls are spawn-per-request (no keepalive); fine for setup.
-// - Only http.{get,post,put,delete} — no websockets, no streaming.
-// - Sandbox is permissive: scripts share the parent require graph
-//   for `node:vm` reasons but we don't expose require/process.
-
-import { readFileSync } from 'node:fs';
-import { createContext, runInContext } from 'node:vm';
-
-// Constants, RunContext, RunResult, interpolate, recordPhase, timedAsync,
-// and sleep live in ./context. They're re-exported below for callers that
-// imported them from ../runner historically.
 
 export type { RunContext, RunResult };
 export { recordPhase };
@@ -160,6 +140,16 @@ export async function runFlow(
     await client.call('wait_commit', { maxMs: 3000, stableMs: 300 }).catch(() => undefined);
   }
 
+  const jsContext = createJsContext({
+    appId: flow.appId,
+    isSimulator: true,
+    platform: 'ios',
+  });
+  const flowEnv = { ...(flow.env || {}) };
+  for (const [key, value] of Object.entries(flowEnv)) {
+    (jsContext as Record<string, unknown>)[key] = value;
+  }
+
   const ctx: RunContext = {
     client,
     udid,
@@ -167,7 +157,9 @@ export async function runFlow(
     dylibPath: options.dylibPath ?? null,
     verbose: options.verbose ?? false,
     flowPath: flow.filePath,
-    outputs: {},
+    jsContext,
+    flowEnv,
+    outputs: jsContext.output,
   };
 
   log(ctx, `▶ ${flow.name || flow.filePath} (${flow.commands.length} steps)`);
@@ -298,8 +290,45 @@ async function runCommand(
   // `- back`, `- launchApp`, etc. js-yaml parses those as plain strings,
   // not `{hideKeyboard: true}`. Normalise so the dispatch below can use
   // the same `'op' in cmd` shape unconditionally.
-  const cmd: MaestroCommand =
+  let cmd: MaestroCommand =
     typeof rawCmd === 'string' ? ({ [rawCmd]: true } as unknown as MaestroCommand) : rawCmd;
+
+  const processedCmd = preprocessCommand(cmd, ctx.jsContext);
+
+  if ('evalScript' in processedCmd) {
+    jsEvalScript((processedCmd as { evalScript: string }).evalScript, ctx.jsContext);
+    return;
+  }
+
+  if ('runScript' in processedCmd) {
+    const raw = (
+      processedCmd as {
+        runScript: string | { file: string; env?: Record<string, string> };
+      }
+    ).runScript;
+    const runCmd = typeof raw === 'string' ? { file: raw } : raw;
+    if (!runCmd.file) {
+      throw new Error('runScript: missing file path');
+    }
+    const mergedEnv = { ...ctx.flowEnv, ...(runCmd.env || {}) };
+    jsRunScript(runCmd.file, mergedEnv, ctx.jsContext, ctx.flowPath);
+    return;
+  }
+
+  if ('assertTrue' in processedCmd) {
+    const expr = (processedCmd as { assertTrue: string }).assertTrue;
+    let code = expr;
+    if (code.startsWith('${') && code.endsWith('}')) {
+      code = code.slice(2, -1);
+    }
+    const result = runInContext(code, ctx.jsContext, { timeout: 1000 });
+    if (!result) {
+      throw new Error(`assertTrue failed: ${expr}`);
+    }
+    return;
+  }
+
+  cmd = processedCmd;
 
   // Reset repeat-tap tracking unless this command itself is a tapOn.
   if (!('tapOn' in cmd)) ctx.lastTapKey = undefined;
@@ -565,7 +594,7 @@ async function runCommand(
     // routinely fire on already-broken state (prior tap landed on
     // the wrong field) and pad the step by 2 s before we fall back
     // to the hardware-keyboard path that types into nowhere anyway.
-    const text = interpolate(String(cmd.inputText), ctx);
+    const text = String(cmd.inputText);
     // Try insert_text (UIKeyInput on the current firstResponder) up
     // to 3 times. Between attempts, if the prior tap target was a
     // testID, re-tap it via argent — that's the cheapest way to
@@ -984,10 +1013,11 @@ async function runCommand(
     return;
   }
   if ('launchApp' in cmd) {
+    const raw = cmd.launchApp;
     const opts =
-      cmd.launchApp === true
+      raw === true || raw == null
         ? { clearState: false }
-        : (cmd.launchApp as {
+        : (raw as {
             clearState?: boolean;
             arguments?: Record<string, string | boolean | number>;
           });
@@ -1127,14 +1157,9 @@ async function runCommand(
     }
     return;
   }
-  if ('runScript' in cmd) {
-    const scriptCmd = (cmd as { runScript: { file: string; env?: Record<string, string> } })
-      .runScript;
-    await runMaestroScript(ctx, scriptCmd);
-    return;
-  }
   if ('runFlow' in cmd) {
-    const sub = cmd.runFlow;
+    const sub: RunFlowCommand =
+      typeof cmd.runFlow === 'string' ? { file: cmd.runFlow } : cmd.runFlow;
     // `when:` clause — evaluate the predicate against current screen.
     // If false, skip the subflow entirely.
     if (sub.when) {
@@ -1167,12 +1192,30 @@ async function runCommand(
     if (sub.file) {
       const subPath = resolve(dirname(ctx.flowPath), sub.file);
       const subFlow = parseMaestroFile(subPath);
+      const envToApply: Record<string, string> = { ...(subFlow.env || {}) };
+      if (sub.env) {
+        for (const [key, value] of Object.entries(sub.env)) {
+          envToApply[key] = value;
+        }
+      }
+      const envSnapshot: Record<string, unknown> = {};
+      const envKeys: string[] = [];
+      if (Object.keys(envToApply).length > 0) {
+        for (const [key, value] of Object.entries(envToApply)) {
+          envSnapshot[key] = (ctx.jsContext as Record<string, unknown>)[key];
+          envKeys.push(key);
+          (ctx.jsContext as Record<string, unknown>)[key] = value;
+        }
+      }
       const prevPath = ctx.flowPath;
       ctx.flowPath = subPath;
       try {
         for (let i = 0; i < subFlow.commands.length; i++)
           await runCommand(ctx, subFlow.commands[i], subFlow.commands[i + 1]);
       } finally {
+        for (const key of envKeys) {
+          (ctx.jsContext as Record<string, unknown>)[key] = envSnapshot[key];
+        }
         ctx.flowPath = prevPath;
       }
       return;
@@ -1205,79 +1248,6 @@ async function runCommand(
   // ~80% of common Maestro grammar; unsupported ops are documented as
   // such in ARCHITECTURE.md.
   log(ctx, `  (unsupported in v0.1, skipped: ${describeCommand(cmd)})`);
-}
-
-function maestroHttpSyncOnce(
-  method: string,
-  url: string,
-  opts?: { headers?: Record<string, string>; body?: string },
-): { status: number; body: string; headers: Record<string, string> } {
-  const args = ['-sS', '-X', method.toUpperCase(), '-w', '\n%{http_code}', url];
-  if (opts?.headers) {
-    for (const [k, v] of Object.entries(opts.headers)) {
-      args.push('-H', `${k}: ${v}`);
-    }
-  }
-  if (opts?.body !== undefined) {
-    args.push('--data-binary', opts.body);
-  }
-  const res = spawnSync('curl', args, { encoding: 'utf-8', maxBuffer: 16 * 1024 * 1024 });
-  const out = (res.stdout ?? '') + (res.stderr ?? '');
-  const nl = out.lastIndexOf('\n');
-  let status = 0;
-  let body = out;
-  if (nl >= 0) {
-    const tail = out.slice(nl + 1).trim();
-    if (/^\d{3}$/.test(tail)) {
-      status = parseInt(tail, 10);
-      body = out.slice(0, nl);
-    }
-  }
-  return { status, body, headers: {} };
-}
-
-function maestroHttpSync(
-  method: string,
-  url: string,
-  opts?: { headers?: Record<string, string>; body?: string },
-): { status: number; body: string; headers: Record<string, string> } {
-  // Bluesky's mock PDS cycles its underlying process on each
-  // setupServer.js POST — the first call after a cycle can land
-  // mid-restart and return empty body + 500. Retry a few times
-  // with backoff before giving up.
-  let last = maestroHttpSyncOnce(method, url, opts);
-  for (let i = 0; i < 4 && (last.status >= 500 || last.body.trim() === ''); i++) {
-    const sleepMs = 500 * (i + 1);
-    spawnSync('sleep', [(sleepMs / 1000).toString()]);
-    last = maestroHttpSyncOnce(method, url, opts);
-  }
-  return last;
-}
-
-async function runMaestroScript(
-  ctx: RunContext,
-  script: { file: string; env?: Record<string, string> },
-): Promise<void> {
-  const scriptPath = resolve(dirname(ctx.flowPath), script.file);
-  const src = readFileSync(scriptPath, 'utf-8');
-  const sandbox = {
-    output: ctx.outputs,
-    http: {
-      get: (url: string, opts?: { headers?: Record<string, string>; body?: string }) =>
-        maestroHttpSync('GET', url, opts),
-      post: (url: string, opts?: { headers?: Record<string, string>; body?: string }) =>
-        maestroHttpSync('POST', url, opts),
-      put: (url: string, opts?: { headers?: Record<string, string>; body?: string }) =>
-        maestroHttpSync('PUT', url, opts),
-      delete: (url: string, opts?: { headers?: Record<string, string>; body?: string }) =>
-        maestroHttpSync('DELETE', url, opts),
-    },
-    json: (s: string) => JSON.parse(s),
-    console: { log: (...a: unknown[]) => process.stderr.write(`[script] ${a.join(' ')}\n`) },
-    ...(script.env ?? {}),
-  };
-  const vmCtx = createContext(sandbox);
-  runInContext(src, vmCtx, { filename: scriptPath, timeout: 30_000 });
 }
 
 function describeCommand(cmd: MaestroCommand): string {

@@ -1,0 +1,10 @@
+appId: com.ennio.example
+env:
+  ABOFLAH_DEMO_ID: demo-account-aboflah
+---
+- runScript: generated-data.js
+- assertTrue: ${output.threadTitle !== undefined}
+- runFlow:
+    file: env-subflow.yaml
+    env:
+      DEMO_ACCOUNT_ID: ${ABOFLAH_DEMO_ID}

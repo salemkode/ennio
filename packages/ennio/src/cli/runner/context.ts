@@ -7,6 +7,7 @@
 // transitions from no-ops. Everything here is pure data — no I/O.
 
 import type { EnnioSocketClient } from '../socket-client';
+import type { JsContext } from '../js-evaluator';
 
 // =====================================================================
 // Wait budgets
@@ -58,6 +59,10 @@ export interface RunContext {
   /** Path to the currently-executing flow file. Used for runFlow
    *  subflow path resolution. */
   flowPath: string;
+  /** Maestro JS context for ${} interpolation, runScript, evalScript. */
+  jsContext: JsContext;
+  /** Top-level flow `env:` block — merged into runScript sandboxes. */
+  flowEnv: Record<string, string>;
   /** Last tapOn target signature. When the next tapOn matches the
    *  same target, the runner shortens its post-tap settle so the two
    *  taps land inside RN's double-tap window (<350 ms). */
@@ -83,8 +88,8 @@ export interface RunContext {
   phaseTotals?: Map<string, number>;
   phaseCounts?: Map<string, number>;
   /** Mutable bag populated by runScript and consumed by ${output.X}
-   *  substitution in subsequent inputText / tapOn text args. Mirrors
-   *  Maestro's `output` global available inside its JS sandbox. */
+   *  substitution in subsequent steps. Mirrors Maestro's `output`
+   *  global inside the JS sandbox (same object as jsContext.output). */
   outputs: Record<string, unknown>;
 }
 
@@ -106,8 +111,8 @@ export interface Rect {
 // Helpers
 // =====================================================================
 
-/// Replace Maestro-style `${output.X}` placeholders with values from
-/// `ctx.outputs`. Also handles `${env.X}` → `process.env.X`.
+/// Replace Maestro-style `${output.X}` / `${env.X}` placeholders.
+/// Prefer preprocessCommand() for full ${KEY} Maestro env interpolation.
 export function interpolate(str: string, ctx: RunContext): string {
   if (typeof str !== 'string') return str;
   return str.replace(/\$\{(output|env)\.([A-Za-z0-9_]+)\}/g, (_, scope, key) => {

@@ -76,7 +76,7 @@ export type MaestroCommand =
   | { longPress: MaestroSelector | string }
   | { longPressOn: MaestroSelector | string }
   | { back: true }
-  | { runFlow: RunFlowCommand }
+  | { runFlow: RunFlowCommand | string }
   | { waitFor: MaestroSelector & { timeout?: number } }
   | { assertAnyVisible: { anyOf: MaestroSelector[] } }
   | { launchApp: true | { clearState?: boolean; appId?: string } }
@@ -92,7 +92,7 @@ export type MaestroCommand =
   | { retry: { maxRetries?: number; commands: MaestroCommand[] } }
   | { assertTrue: string }
   | { evalScript: string }
-  | { runScript: { file: string; env?: Record<string, string> } }
+  | { runScript: { file: string; env?: Record<string, string> } | string }
   | { setLocation: { latitude: number; longitude: number } | string }
   | { setPermissions: Record<string, 'allow' | 'deny' | 'unset'> }
   | { setAirplaneMode: 'enabled' | 'disabled' | true | false }
@@ -118,6 +118,12 @@ export interface RunFlowCommand {
   file?: string;
   when?: MaestroCondition;
   commands?: MaestroCommand[];
+  /**
+   * Per-invocation env overrides passed from the parent flow into a
+   * subflow file. Values support `${}` interpolation against the
+   * parent's JS context (including `output.*` from runScript).
+   */
+  env?: Record<string, string>;
 }
 
 export interface MaestroFlow {
@@ -285,14 +291,17 @@ export function expandFlow(
 
   // Process commands and load any referenced subflows
   for (const cmd of flow.commands) {
-    if ('runFlow' in cmd && cmd.runFlow.file) {
-      const subflowPath = resolveSubflowPath(flow.filePath, cmd.runFlow.file);
-      if (existsSync(subflowPath)) {
-        const subflow = parseMaestroFile(subflowPath);
-        subflows.push(subflow);
-        // Recursively expand subflows
-        const expanded = expandFlow(subflow, expandedPaths);
-        subflows.push(...expanded.subflows);
+    if ('runFlow' in cmd) {
+      const runFlow = cmd.runFlow;
+      const file = typeof runFlow === 'string' ? runFlow : runFlow.file;
+      if (file) {
+        const subflowPath = resolveSubflowPath(flow.filePath, file);
+        if (existsSync(subflowPath)) {
+          const subflow = parseMaestroFile(subflowPath);
+          subflows.push(subflow);
+          const expanded = expandFlow(subflow, expandedPaths);
+          subflows.push(...expanded.subflows);
+        }
       }
     }
   }
